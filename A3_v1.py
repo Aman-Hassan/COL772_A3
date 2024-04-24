@@ -7,7 +7,7 @@ import numpy as np
 import pandas as pd
 import sklearn
 import scipy
-from datasets import load_dataset
+from datasets import load_dataset, concatenate_datasets
 from transformers import Trainer, TrainingArguments, AutoTokenizer, AutoModelForSeq2SeqLM, TrainerCallback
 from accelerate import Accelerator
 from accelerate.data_loader import DataLoader
@@ -55,36 +55,44 @@ class PrintSummaryCallback(TrainerCallback):
         train_loss = state.log_history[-1].train_loss
         print(f"Epoch {state.epoch} - Train Loss: {train_loss}")
 
-# Data is jsonl file, however the "article" attribute contains \n characters which interfere with the jsonl format,
-# So we first read each line in the file and then load it as json
-def load_data(path_to_data):
-    data = []
-    with open(path_to_data, "r") as f:
-        for line in f:
-            data.append(json.loads(line))
-            print(line)
-    return data
-
 def preprocess_data(examples, tokenizer, max_input_length, max_output_length):
-    model_inputs = tokenizer(examples["article"], max_length=max_input_length, truncation=True, return_tensors="pt")
-    with tokenizer.as_target_tokenizer():
-        labels = tokenizer(examples["lay_summary"], max_length=max_output_length, truncation=True, return_tensors="pt")
-    model_inputs["labels"] = labels["input_ids"]
-    return model_inputs
+    # Tokenize input articles
+    inputs = tokenizer(examples["article"], 
+                       max_length=max_input_length, 
+                       padding="max_length", 
+                       truncation=True, 
+                       return_tensors="pt")
 
-def train(data_dir, model_save_path, model_name="google/flan-t5-base", max_input_length=512, max_output_length=128, num_epochs=5, lora_rank=8, lora_alpha=32, lora_dropout=0.1, train_batch_size=8, eval_batch_size=8, learning_rate=1e-4, weight_decay=0.01, logging_steps=10, eval_steps=100, save_steps=100):
-    # Load datasets
+    # Tokenize target lay summaries
+    targets = tokenizer(examples["lay_summary"], 
+                        max_length=max_output_length, 
+                        padding="max_length", 
+                        truncation=True, 
+                        return_tensors="pt")
+
+    # Assign labels to model inputs
+    inputs["labels"] = targets.input_ids
+
+    return inputs
+
+
+def train(data_dir, model_save_path, model_name="google/flan-t5-small", max_input_length=512, max_output_length=128, num_epochs=5, lora_rank=8, lora_alpha=32, lora_dropout=0.1, train_batch_size=8, eval_batch_size=8, learning_rate=1e-4, weight_decay=0.01, logging_steps=10, eval_steps=100, save_steps=100):
+    
+    # load datasets from jsonl files and ignore the '\n' characters in the "article" attribute
     elife_dataset = load_dataset("json", data_files={
         "train": os.path.join(data_dir, "eLife_train.jsonl"),
         "validation": os.path.join(data_dir, "eLife_val.jsonl")
-    }, field="data")
+    })
 
     plos_dataset = load_dataset("json", data_files={
         "train": os.path.join(data_dir, "PLOS_train.jsonl"),
         "validation": os.path.join(data_dir, "PLOS_val.jsonl")
-    }, field="data")
+    })
 
-    datasets = elife_dataset.concatenate(plos_dataset)
+    # Concatenate the datasets into a single dataset with both train and validation splits
+    datasets_train = concatenate_datasets([elife_dataset["train"], plos_dataset["train"]])
+    datasets_val = concatenate_datasets([elife_dataset["validation"], plos_dataset["validation"]])
+    datasets = {"train": datasets_train, "validation": datasets_val}
 
     print("Loaded datasets")
 
@@ -96,16 +104,25 @@ def train(data_dir, model_save_path, model_name="google/flan-t5-base", max_input
     print("Loaded tokenizer and model")
 
     # Preprocess data
-    datasets = datasets.map(
-        lambda x: preprocess_data(x, tokenizer, max_input_length, max_output_length),
-        batched=True,
-        remove_columns=datasets["train"].column_names
-    )
+    datasets = {
+    "train": datasets["train"].map(
+        lambda x: preprocess_data(x, tokenizer, max_input_length, max_output_length), 
+        batched=True),
+    "validation": datasets["validation"].map(
+        lambda x: preprocess_data(x, tokenizer, max_input_length, max_output_length), 
+        batched=True),
+    }
 
     datasets = {
-        "train": datasets["train"].with_format("torch").map(lambda x: {k: v.to(device) for k, v in x.items()}, batched=True),
-        "validation": datasets["validation"].with_format("torch").map(lambda x: {k: v.to(device) for k, v in x.items()}, batched=True),
-    }
+    "train": datasets["train"].with_format("torch").map(
+        lambda x: {k: torch.tensor(v).to(device) if isinstance(v, np.ndarray) else v for k, v in x.items()},
+        batched=True,
+    ),
+    "validation": datasets["validation"].with_format("torch").map(
+        lambda x: {k: torch.tensor(v).to(device) if isinstance(v, np.ndarray) else v for k, v in x.items()},
+        batched=True,
+    ),
+}
 
     print("Preprocessed data")
 
@@ -113,7 +130,7 @@ def train(data_dir, model_save_path, model_name="google/flan-t5-base", max_input
     peft_config = LoraConfig(
         r=lora_rank,
         lora_alpha=lora_alpha,
-        target_modules=["q_proj", "v_proj"],
+        target_modules=["q", "v"],  # Adjust target modules according to your base model
         lora_dropout=lora_dropout,
         bias="none",
         task_type=TaskType.CAUSAL_LM,
@@ -141,39 +158,42 @@ def train(data_dir, model_save_path, model_name="google/flan-t5-base", max_input
         model, optimizer, train_dataloader, eval_dataloader
     )
 
+    print("Prepared model, optimizer, and dataloaders for accelerator")
+
     # Set up PEFT trainer
     trainer = get_peft_model(model.to(device), peft_config)
     trainer = Trainer(
-        trainer.to(device),
+        model=trainer.to(device),
+        args=TrainingArguments(
+            per_device_train_batch_size=train_batch_size,
+            per_device_eval_batch_size=eval_batch_size,
+            learning_rate=learning_rate,
+            num_train_epochs=num_epochs,
+            weight_decay=weight_decay,
+            logging_steps=logging_steps,
+            evaluation_strategy="steps",
+            eval_steps=eval_steps,
+            save_strategy="steps",
+            save_steps=save_steps,
+            output_dir=model_save_path,
+        ),
         train_dataset=datasets["train"],
         eval_dataset=datasets["validation"],
-        args=peft.LoraConfig(
-            r=lora_rank,
-            lora_alpha=lora_alpha,
-            target_modules=["q_proj", "v_proj"],
-            lora_dropout=lora_dropout,
-            bias="none",
-            task_type=TaskType.CAUSAL_LM,
-        ),
-        train_batch_size=train_batch_size,
-        eval_batch_size=eval_batch_size,
-        learning_rate=learning_rate,
-        num_train_epochs=num_epochs,
-        weight_decay=weight_decay,
-        logging_steps=logging_steps,
-        evaluation_strategy="steps",
-        eval_steps=eval_steps,
-        save_strategy="steps",
-        save_steps=save_steps,
-        output_dir=model_save_path,
         callbacks=[PrintSummaryCallback(tokenizer, max_output_length)],
     )
+
+
+    print("Set up PEFT trainer")
 
     # Train loop
     trainer.train()
 
+    print("Training complete")
+
     # Save model
     trainer.save_pretrained(model_save_path)
+
+    print("Model saved")
 
 def test(test_dir, model_load_path, predictions_save_path, model_name="google/flan-t5-small", max_input_length=512, max_output_length=128):
     # Load tokenizer and model
@@ -209,7 +229,7 @@ def test(test_dir, model_load_path, predictions_save_path, model_name="google/fl
         f.write("\n".join(summaries[:num_elife]))
     with open(os.path.join(predictions_save_path, "plos.txt"), "w") as f:
         f.write("\n".join(summaries[num_elife:]))
-
+            
 # "train" or "test" the model
 if __name__ == '__main__':
     if device == "cuda":
