@@ -1,6 +1,8 @@
 import sys
 import os
 import torch
+from torch.nn.utils.rnn import pad_sequence
+import torch.nn.functional as F
 import gensim
 import json
 import numpy as np
@@ -13,6 +15,7 @@ from accelerate import Accelerator
 from accelerate.data_loader import DataLoader
 import peft
 from peft import LoraConfig, TaskType, get_peft_model, prepare_model_for_kbit_training
+from peft import PeftModel, PeftConfig
 from rouge_score import rouge_scorer
 from bert_score import score as bert_score
 from textstat import flesch_kincaid_grade, dale_chall_readability_score, coleman_liau_index
@@ -41,78 +44,82 @@ device = (
 
 # The following class is for the purpose of printing the predicted summary and loss after each epoch (which is not available in the Trainer class by default)
 class PrintSummaryCallback(TrainerCallback):
-    def __init__(self, tokenizer, max_output_length):
+    def __init__(self, tokenizer, max_output_length, eval_dataloader):
         self.tokenizer = tokenizer
         self.max_output_length = max_output_length
+        self.eval_dataloader = eval_dataloader
 
-    def on_epoch_end(self, args, state, control, **kwargs):
-        if state.trainer is not None and state.trainer.eval_dataloader is not None:
+    def on_step_end(self, args, state, control, model=None, **kwargs):
+        if self.eval_dataloader is not None:
             # Print predicted summary
-            batch = next(iter(state.trainer.eval_dataloader))
-            input_ids = batch["input_ids"]
-            labels = batch["labels"]
-            outputs = state.model.generate(input_ids, max_length=self.max_output_length)
-            summary = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
-            print(f"Predicted Summary: {summary}")
+            batch = next(iter(self.eval_dataloader))  # Get the first batch from the dataloader
+            input_ids = batch["input_ids"].to(device)
+            if model is not None and hasattr(model, 'generate'):
+                outputs = model.generate(input_ids, max_length=self.max_output_length)
+                summary = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
+                print(f"Predicted Summary: {summary}")
+            elif model is None:
+                print("Model is not provided.")
+            else:
+                print("Model does not have a generate method.")
 
             # Print loss
-            train_loss = state.log_history[-1].train_loss
-            print(f"Epoch {state.epoch} - Train Loss: {train_loss}")
+            if hasattr(state, 'log_history') and len(state.log_history) > 0 and 'loss' in state.log_history[-1]:
+                train_loss = state.log_history[-1]["loss"]
+                print(f"Iteration {state.global_step} - Train Loss: {train_loss}")
         else:
             print("Evaluation dataloader is not provided.")
 
 class EvaluateSummaryCallback(TrainerCallback):
-    def __init__(self, compute_metrics):
+    def __init__(self, tokenizer,compute_metrics, max_output_length, eval_dataloader):
+        self.tokenizer = tokenizer
         self.compute_metrics = compute_metrics
+        self.max_output_length = max_output_length
+        self.eval_dataloader = eval_dataloader
 
-    def on_epoch_end(self, args, state, control, **kwargs):
+    def on_step_end(self, args, state, control, model=None, **kwargs):
         # Check if compute_metrics is available
         if self.compute_metrics is None:
             print("No compute_metrics function provided.")
             return
 
-        # Get the evaluation dataset
-        eval_dataset = state.trainer.eval_dataset
+        # Evaluate the model the evaluation dataloader
+        if self.eval_dataloader is not None and model is not None and hasattr(model, 'generate'):
+            predictions = []
+            labels = []
+            
+            # Get the first batch from the dataloader
+            batch = next(iter(self.eval_dataloader))
+            input_ids = batch["input_ids"].to(device)
+            batch_predictions = model.generate(input_ids, max_length=self.max_output_length)
 
-        # Check if eval_dataset is available
-        if eval_dataset is None:
-            print("No evaluation dataset provided.")
-            return
+            # Pad the batch_predictions to max_output_length
+            if batch_predictions.size(1) < self.max_output_length:
+                batch_predictions = F.pad(batch_predictions, (0, self.max_output_length - batch_predictions.size(1)))
 
-        # Evaluate the model on the evaluation dataset
-        eval_predictions = state.trainer.predict(eval_dataset)
-        metrics = self.compute_metrics(eval_predictions)
+            # Decode the tensor to strings
+            batch_predictions = [self.tokenizer.decode(g, skip_special_tokens=True) for g in batch_predictions]
+            labels = [self.tokenizer.decode(l, skip_special_tokens=True) for l in batch["labels"]]
+            
+            predictions.extend(batch_predictions)
+            labels.extend(labels)
 
-        # Print the evaluation metrics
-        print("Evaluation Metrics:")
-        for metric_name, metric_value in metrics.items():
-            print(f"{metric_name}: {metric_value}")
+            print(f"Number of predictions: {len(predictions)}")
+            print(f"Number of labels: {len(labels)}")
 
+            prediction_output = {"predictions": predictions, "label_ids": labels}
+            metrics = self.compute_metrics(prediction_output)
 
-def preprocess_data(examples, tokenizer, max_input_length, max_output_length):
-    # Tokenize input articles
-    inputs = tokenizer(examples["article"], 
-                       max_length=max_input_length, 
-                       padding="max_length", 
-                       truncation=True, 
-                       return_tensors="pt")
+            # Print the evaluation metrics
+            print("Evaluation Metrics:")
+            for metric_name, metric_value in metrics.items():
+                print(f"{metric_name}: {metric_value}")
 
-    # Tokenize target lay summaries
-    targets = tokenizer(examples["lay_summary"], 
-                        max_length=max_output_length, 
-                        padding="max_length", 
-                        truncation=True, 
-                        return_tensors="pt")
-
-    # Assign labels to model inputs
-    inputs["labels"] = targets.input_ids
-
-    return inputs
 
 def compute_metrics(eval_pred):
     # Extracting predictions and labels
-    generated_summaries = eval_pred.predictions
-    reference_summaries = eval_pred.label_ids
+    generated_summaries = eval_pred["predictions"]
+    reference_summaries = eval_pred["label_ids"]
 
     # ROUGE scores computation
     def compute_rouge_scores(hypotheses, references):
@@ -190,6 +197,34 @@ def compute_metrics(eval_pred):
         'factuality': factuality_scores
     }
 
+def preprocess_data(examples, tokenizer, max_input_length, max_output_length):
+    # Tokenize input articles
+    inputs = tokenizer(examples["article"], 
+                       max_length=max_input_length, 
+                       padding="max_length", 
+                       truncation=True, 
+                       return_tensors="pt")
+
+    # Tokenize target lay summaries
+    targets = tokenizer(examples["lay_summary"], 
+                        max_length=max_output_length, 
+                        padding="max_length", 
+                        truncation=True, 
+                        return_tensors="pt")
+
+    # Assign labels to model inputs
+    inputs["labels"] = targets.input_ids
+
+    return inputs
+
+def collate_fn(batch):
+    inputs = [item["input_ids"] for item in batch]
+    targets = [item["labels"] for item in batch]
+
+    inputs = pad_sequence(inputs, batch_first=True, padding_value=0)
+    targets = pad_sequence(targets, batch_first=True, padding_value=0)
+
+    return {'input_ids': inputs, 'labels': targets}
 
 def train(data_dir, model_save_path, model_name="google/flan-t5-small", max_input_length=512, max_output_length=128, num_epochs=5, lora_rank=8, lora_alpha=32, lora_dropout=0.1, train_batch_size=8, eval_batch_size=8, learning_rate=1e-4, weight_decay=0.01, logging_steps=10, eval_steps=100, save_steps=100):
     
@@ -231,13 +266,11 @@ def train(data_dir, model_save_path, model_name="google/flan-t5-small", max_inpu
     datasets = {
     "train": datasets["train"].with_format("torch").map(
         lambda x: {k: torch.tensor(v).to(device) if isinstance(v, np.ndarray) else v for k, v in x.items()},
-        batched=True,
-    ),
+        batched=True),
     "validation": datasets["validation"].with_format("torch").map(
         lambda x: {k: torch.tensor(v).to(device) if isinstance(v, np.ndarray) else v for k, v in x.items()},
-        batched=True,
-    ),
-}
+        batched=True),
+    }
 
     print("Preprocessed data")
 
@@ -260,8 +293,12 @@ def train(data_dir, model_save_path, model_name="google/flan-t5-small", max_inpu
     accelerator = Accelerator()
 
     # Prepare dataloaders
-    train_dataloader = DataLoader(datasets["train"], batch_size=train_batch_size, shuffle=True)
-    eval_dataloader = DataLoader(datasets["validation"], batch_size=eval_batch_size)
+    train_dataloader = DataLoader(datasets["train"], batch_size=train_batch_size, shuffle=True, collate_fn=collate_fn)
+    eval_dataloader = DataLoader(datasets["validation"], batch_size=eval_batch_size, collate_fn=collate_fn)
+    
+    for batch in train_dataloader:
+        print(batch.keys())
+        break
 
     print("Prepared dataloaders")
     
@@ -276,9 +313,10 @@ def train(data_dir, model_save_path, model_name="google/flan-t5-small", max_inpu
     print("Prepared model, optimizer, and dataloaders for accelerator")
 
     # Set up PEFT trainer
-    trainer = get_peft_model(model.to(device), peft_config)
+    peft_model = get_peft_model(model.to(device), peft_config)
+
     trainer = Trainer(
-        model=trainer.to(device),
+        model=peft_model.to(device),
         args=TrainingArguments(
             per_device_train_batch_size=train_batch_size,
             per_device_eval_batch_size=eval_batch_size,
@@ -295,10 +333,9 @@ def train(data_dir, model_save_path, model_name="google/flan-t5-small", max_inpu
         ),
         train_dataset=datasets["train"],
         eval_dataset=datasets["validation"],
-        compute_metrics=compute_metrics, # Should comment this out when submitting, to avoid unnecessary output and save time
-        callbacks=[PrintSummaryCallback(tokenizer, max_output_length)], # Should comment this out when submitting, to avoid unnecessary output and save time
+        # compute_metrics=compute_metrics, # Should comment this out when submitting, to avoid unnecessary output and save time
+        # callbacks=[PrintSummaryCallback(tokenizer, max_output_length, eval_dataloader), EvaluateSummaryCallback(tokenizer, compute_metrics,max_output_length, eval_dataloader)],
     )
-
 
 
     print("Set up PEFT trainer")
@@ -309,30 +346,33 @@ def train(data_dir, model_save_path, model_name="google/flan-t5-small", max_inpu
     print("Training complete")
 
     # Save model
-    trainer.save_pretrained(model_save_path)
+    trainer.save_model(model_save_path)
 
     print("Model saved")
 
 def test(test_dir, model_load_path, predictions_save_path, model_name="google/flan-t5-small", max_input_length=512, max_output_length=128):
     # Load tokenizer and model
-    tokenizer = AutoTokenizer.from_pretrained(model_load_path)
-    model = AutoModelForSeq2SeqLM.from_pretrained(model_load_path, load_in_8bit=True)
+    peft_model_path = model_load_path
+    config = PeftConfig.from_pretrained(peft_model_path)
+    model =  AutoModelForSeq2SeqLM.from_pretrained(config.base_model_name_or_path)
+    model = PeftModel.from_pretrained(model, peft_model_path)
+    tokenizer = AutoTokenizer.from_pretrained(config.base_model_name_or_path)
 
     # Load test datasets
     elife_dataset = load_dataset("json", data_files={
         "test": os.path.join(test_dir, "eLife_test.jsonl")
-    }, field="data")
+    })
 
     plos_dataset = load_dataset("json", data_files={
         "test": os.path.join(test_dir, "PLOS_test.jsonl")
-    }, field="data")
+    })
 
     # Find the number of examples in each dataset
     num_elife = len(elife_dataset["test"])
     num_plos = len(plos_dataset["test"])
 
     # Concatenate the datasets into a combined test dataset
-    test_dataset = elife_dataset.concatenate(plos_dataset)
+    test_dataset = concatenate_datasets([elife_dataset["test"], plos_dataset["test"]])
 
     # Generate summaries
     summaries = []
@@ -356,7 +396,7 @@ if __name__ == '__main__':
 
     # For purpose of kaggle uncomment the following code block
     # data_dir = '/kaggle/input/nlp-a3'
-    # model_save_path = '/kaggle/input/models'
+    # model_save_path = '/kaggle/output/models'
     
     # print("Training model")
     # train(data_dir, model_save_path)
@@ -376,6 +416,7 @@ if __name__ == '__main__':
 
     # If arg[1] is test, then arg[2] contains path to the testfiles directory, arg[3] contains path to load model from, arg[4] contains path to save the predictions
     if sys.argv[1] == "test":
+        print(sys.argv)
         test_dir = sys.argv[2]
         model_load_path = sys.argv[3]
         predictions_save_path = sys.argv[4]

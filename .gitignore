@@ -168,3 +168,6 @@ data/
 
 # model folder
 models/
+flan-t5_trainer/
+biogpt_model/
+predictions/
