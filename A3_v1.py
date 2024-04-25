@@ -13,6 +13,9 @@ from accelerate import Accelerator
 from accelerate.data_loader import DataLoader
 import peft
 from peft import LoraConfig, TaskType, get_peft_model, prepare_model_for_kbit_training
+from rouge_score import rouge_scorer
+from bert_score import score as bert_score
+from textstat import flesch_kincaid_grade, dale_chall_readability_score, coleman_liau_index
 
 # Color scheme for comments (NEED TO INSTALL "Colorful Comments" vscode extension for this to work):
 # 0) # Regular comments
@@ -43,17 +46,48 @@ class PrintSummaryCallback(TrainerCallback):
         self.max_output_length = max_output_length
 
     def on_epoch_end(self, args, state, control, **kwargs):
-        # Print predicted summary
-        batch = next(iter(state.eval_dataloader))
-        input_ids = batch["input_ids"]
-        labels = batch["labels"]
-        outputs = state.model.generate(input_ids, max_length=self.max_output_length)
-        summary = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
-        print(f"Predicted Summary: {summary}")
+        if state.trainer is not None and state.trainer.eval_dataloader is not None:
+            # Print predicted summary
+            batch = next(iter(state.trainer.eval_dataloader))
+            input_ids = batch["input_ids"]
+            labels = batch["labels"]
+            outputs = state.model.generate(input_ids, max_length=self.max_output_length)
+            summary = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
+            print(f"Predicted Summary: {summary}")
 
-        # Print loss
-        train_loss = state.log_history[-1].train_loss
-        print(f"Epoch {state.epoch} - Train Loss: {train_loss}")
+            # Print loss
+            train_loss = state.log_history[-1].train_loss
+            print(f"Epoch {state.epoch} - Train Loss: {train_loss}")
+        else:
+            print("Evaluation dataloader is not provided.")
+
+class EvaluateSummaryCallback(TrainerCallback):
+    def __init__(self, compute_metrics):
+        self.compute_metrics = compute_metrics
+
+    def on_epoch_end(self, args, state, control, **kwargs):
+        # Check if compute_metrics is available
+        if self.compute_metrics is None:
+            print("No compute_metrics function provided.")
+            return
+
+        # Get the evaluation dataset
+        eval_dataset = state.trainer.eval_dataset
+
+        # Check if eval_dataset is available
+        if eval_dataset is None:
+            print("No evaluation dataset provided.")
+            return
+
+        # Evaluate the model on the evaluation dataset
+        eval_predictions = state.trainer.predict(eval_dataset)
+        metrics = self.compute_metrics(eval_predictions)
+
+        # Print the evaluation metrics
+        print("Evaluation Metrics:")
+        for metric_name, metric_value in metrics.items():
+            print(f"{metric_name}: {metric_value}")
+
 
 def preprocess_data(examples, tokenizer, max_input_length, max_output_length):
     # Tokenize input articles
@@ -74,6 +108,87 @@ def preprocess_data(examples, tokenizer, max_input_length, max_output_length):
     inputs["labels"] = targets.input_ids
 
     return inputs
+
+def compute_metrics(eval_pred):
+    # Extracting predictions and labels
+    generated_summaries = eval_pred.predictions
+    reference_summaries = eval_pred.label_ids
+
+    # ROUGE scores computation
+    def compute_rouge_scores(hypotheses, references):
+        scorer = rouge_scorer.RougeScorer(['rouge1', 'rouge2', 'rougeL'], use_stemmer=True)
+        rouge1_scores = []
+        rouge2_scores = []
+        rougeL_scores = []
+
+        for hyp, ref in zip(hypotheses, references):
+            scores = scorer.score(hyp, ref)
+            rouge1_scores.append(scores['rouge1'].fmeasure)
+            rouge2_scores.append(scores['rouge2'].fmeasure)
+            rougeL_scores.append(scores['rougeL'].fmeasure)
+
+        return {
+            'rouge1': np.mean(rouge1_scores),
+            'rouge2': np.mean(rouge2_scores),
+            'rougeL': np.mean(rougeL_scores)
+        }
+
+    rouge_scores = compute_rouge_scores(generated_summaries, reference_summaries)
+
+    # BERTScore computation
+    def compute_bert_scores(hypotheses, references):
+        P, R, F1 = bert_score(hypotheses, references, lang='en')
+        return {
+            'bert_P': P.mean().item(),
+            'bert_R': R.mean().item(),
+            'bert_F1': F1.mean().item()
+        }
+
+    bert_scores = compute_bert_scores(generated_summaries, reference_summaries)
+
+    # Readability scores computation (FKGL, DCRS, CLI, LENS)
+    def compute_readability_scores(hypotheses):
+        # Compute FKGL, DCRS, CLI, LENS here
+        # Example code for FKGL (You may need to install the 'textstat' library for FKGL and DCRS):
+        # from textstat import flesch_kincaid_grade, dale_chall_readability_score, coleman_liau_index
+        # fkgl_scores = [flesch_kincaid_grade(summary) for summary in hypotheses]
+        # dcrs_scores = [dale_chall_readability_score(summary) for summary in hypotheses]
+        # cli_scores = [coleman_liau_index(summary) for summary in hypotheses]
+        # lens_scores = []  # Implement LENS computation
+        fkgl_scores = []
+        dcrs_scores = []
+        cli_scores = []
+        lens_scores = []  # Placeholder for LENS
+        return {
+            'fkgl': np.mean(fkgl_scores),
+            'dcrs': np.mean(dcrs_scores),
+            'cli': np.mean(cli_scores),
+            'lens': np.mean(lens_scores)
+        }
+
+    readability_scores = compute_readability_scores(generated_summaries)
+
+    # Factuality scores computation (AlignScore, SummaC)
+    def compute_factuality_scores(hypotheses):
+        # Compute AlignScore and SummaC here
+        # Example code for AlignScore and SummaC:
+        # align_scores = []  # Implement AlignScore computation
+        # summac_scores = []  # Implement SummaC computation
+        align_scores = []  # Placeholder for AlignScore
+        summac_scores = []  # Placeholder for SummaC
+        return {
+            'align_score': np.mean(align_scores),
+            'summac': np.mean(summac_scores)
+        }
+
+    factuality_scores = compute_factuality_scores(generated_summaries)
+
+    return {
+        'rouge': rouge_scores,
+        'bert_score': bert_scores,
+        'readability': readability_scores,
+        'factuality': factuality_scores
+    }
 
 
 def train(data_dir, model_save_path, model_name="google/flan-t5-small", max_input_length=512, max_output_length=128, num_epochs=5, lora_rank=8, lora_alpha=32, lora_dropout=0.1, train_batch_size=8, eval_batch_size=8, learning_rate=1e-4, weight_decay=0.01, logging_steps=10, eval_steps=100, save_steps=100):
@@ -175,12 +290,15 @@ def train(data_dir, model_save_path, model_name="google/flan-t5-small", max_inpu
             eval_steps=eval_steps,
             save_strategy="steps",
             save_steps=save_steps,
+            report_to="none",
             output_dir=model_save_path,
         ),
         train_dataset=datasets["train"],
         eval_dataset=datasets["validation"],
-        callbacks=[PrintSummaryCallback(tokenizer, max_output_length)],
+        compute_metrics=compute_metrics, # Should comment this out when submitting, to avoid unnecessary output and save time
+        callbacks=[PrintSummaryCallback(tokenizer, max_output_length)], # Should comment this out when submitting, to avoid unnecessary output and save time
     )
+
 
 
     print("Set up PEFT trainer")
