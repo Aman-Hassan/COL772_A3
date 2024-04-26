@@ -1,6 +1,8 @@
 import sys
 import os
 import torch
+import codecs
+from tqdm import tqdm
 from torch.nn.utils.rnn import pad_sequence
 import torch.nn.functional as F
 import gensim
@@ -41,162 +43,6 @@ device = (
     else "cpu"
 )
 
-
-# The following class is for the purpose of printing the predicted summary and loss after each epoch (which is not available in the Trainer class by default)
-class PrintSummaryCallback(TrainerCallback):
-    def __init__(self, tokenizer, max_output_length, eval_dataloader):
-        self.tokenizer = tokenizer
-        self.max_output_length = max_output_length
-        self.eval_dataloader = eval_dataloader
-
-    def on_step_end(self, args, state, control, model=None, **kwargs):
-        if self.eval_dataloader is not None:
-            # Print predicted summary
-            batch = next(iter(self.eval_dataloader))  # Get the first batch from the dataloader
-            input_ids = batch["input_ids"].to(device)
-            if model is not None and hasattr(model, 'generate'):
-                outputs = model.generate(input_ids, max_length=self.max_output_length)
-                summary = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
-                print(f"Predicted Summary: {summary}")
-            elif model is None:
-                print("Model is not provided.")
-            else:
-                print("Model does not have a generate method.")
-
-            # Print loss
-            if hasattr(state, 'log_history') and len(state.log_history) > 0 and 'loss' in state.log_history[-1]:
-                train_loss = state.log_history[-1]["loss"]
-                print(f"Iteration {state.global_step} - Train Loss: {train_loss}")
-        else:
-            print("Evaluation dataloader is not provided.")
-
-class EvaluateSummaryCallback(TrainerCallback):
-    def __init__(self, tokenizer,compute_metrics, max_output_length, eval_dataloader):
-        self.tokenizer = tokenizer
-        self.compute_metrics = compute_metrics
-        self.max_output_length = max_output_length
-        self.eval_dataloader = eval_dataloader
-
-    def on_step_end(self, args, state, control, model=None, **kwargs):
-        # Check if compute_metrics is available
-        if self.compute_metrics is None:
-            print("No compute_metrics function provided.")
-            return
-
-        # Evaluate the model the evaluation dataloader
-        if self.eval_dataloader is not None and model is not None and hasattr(model, 'generate'):
-            predictions = []
-            labels = []
-            
-            # Get the first batch from the dataloader
-            batch = next(iter(self.eval_dataloader))
-            input_ids = batch["input_ids"].to(device)
-            batch_predictions = model.generate(input_ids, max_length=self.max_output_length)
-
-            # Pad the batch_predictions to max_output_length
-            if batch_predictions.size(1) < self.max_output_length:
-                batch_predictions = F.pad(batch_predictions, (0, self.max_output_length - batch_predictions.size(1)))
-
-            # Decode the tensor to strings
-            batch_predictions = [self.tokenizer.decode(g, skip_special_tokens=True) for g in batch_predictions]
-            labels = [self.tokenizer.decode(l, skip_special_tokens=True) for l in batch["labels"]]
-            
-            predictions.extend(batch_predictions)
-            labels.extend(labels)
-
-            print(f"Number of predictions: {len(predictions)}")
-            print(f"Number of labels: {len(labels)}")
-
-            prediction_output = {"predictions": predictions, "label_ids": labels}
-            metrics = self.compute_metrics(prediction_output)
-
-            # Print the evaluation metrics
-            print("Evaluation Metrics:")
-            for metric_name, metric_value in metrics.items():
-                print(f"{metric_name}: {metric_value}")
-
-
-def compute_metrics(eval_pred):
-    # Extracting predictions and labels
-    generated_summaries = eval_pred["predictions"]
-    reference_summaries = eval_pred["label_ids"]
-
-    # ROUGE scores computation
-    def compute_rouge_scores(hypotheses, references):
-        scorer = rouge_scorer.RougeScorer(['rouge1', 'rouge2', 'rougeL'], use_stemmer=True)
-        rouge1_scores = []
-        rouge2_scores = []
-        rougeL_scores = []
-
-        for hyp, ref in zip(hypotheses, references):
-            scores = scorer.score(hyp, ref)
-            rouge1_scores.append(scores['rouge1'].fmeasure)
-            rouge2_scores.append(scores['rouge2'].fmeasure)
-            rougeL_scores.append(scores['rougeL'].fmeasure)
-
-        return {
-            'rouge1': np.mean(rouge1_scores),
-            'rouge2': np.mean(rouge2_scores),
-            'rougeL': np.mean(rougeL_scores)
-        }
-
-    rouge_scores = compute_rouge_scores(generated_summaries, reference_summaries)
-
-    # BERTScore computation
-    def compute_bert_scores(hypotheses, references):
-        P, R, F1 = bert_score(hypotheses, references, lang='en')
-        return {
-            'bert_P': P.mean().item(),
-            'bert_R': R.mean().item(),
-            'bert_F1': F1.mean().item()
-        }
-
-    bert_scores = compute_bert_scores(generated_summaries, reference_summaries)
-
-    # Readability scores computation (FKGL, DCRS, CLI, LENS)
-    def compute_readability_scores(hypotheses):
-        # Compute FKGL, DCRS, CLI, LENS here
-        # Example code for FKGL (You may need to install the 'textstat' library for FKGL and DCRS):
-        # from textstat import flesch_kincaid_grade, dale_chall_readability_score, coleman_liau_index
-        # fkgl_scores = [flesch_kincaid_grade(summary) for summary in hypotheses]
-        # dcrs_scores = [dale_chall_readability_score(summary) for summary in hypotheses]
-        # cli_scores = [coleman_liau_index(summary) for summary in hypotheses]
-        # lens_scores = []  # Implement LENS computation
-        fkgl_scores = []
-        dcrs_scores = []
-        cli_scores = []
-        lens_scores = []  # Placeholder for LENS
-        return {
-            'fkgl': np.mean(fkgl_scores),
-            'dcrs': np.mean(dcrs_scores),
-            'cli': np.mean(cli_scores),
-            'lens': np.mean(lens_scores)
-        }
-
-    readability_scores = compute_readability_scores(generated_summaries)
-
-    # Factuality scores computation (AlignScore, SummaC)
-    def compute_factuality_scores(hypotheses):
-        # Compute AlignScore and SummaC here
-        # Example code for AlignScore and SummaC:
-        # align_scores = []  # Implement AlignScore computation
-        # summac_scores = []  # Implement SummaC computation
-        align_scores = []  # Placeholder for AlignScore
-        summac_scores = []  # Placeholder for SummaC
-        return {
-            'align_score': np.mean(align_scores),
-            'summac': np.mean(summac_scores)
-        }
-
-    factuality_scores = compute_factuality_scores(generated_summaries)
-
-    return {
-        'rouge': rouge_scores,
-        'bert_score': bert_scores,
-        'readability': readability_scores,
-        'factuality': factuality_scores
-    }
-
 def preprocess_data(examples, tokenizer, max_input_length, max_output_length):
     # Tokenize input articles
     inputs = tokenizer(examples["article"], 
@@ -226,8 +72,25 @@ def collate_fn(batch):
 
     return {'input_ids': inputs, 'labels': targets}
 
-def train(data_dir, model_save_path, model_name="google/flan-t5-small", max_input_length=512, max_output_length=128, num_epochs=5, lora_rank=8, lora_alpha=32, lora_dropout=0.1, train_batch_size=8, eval_batch_size=8, learning_rate=1e-4, weight_decay=0.01, logging_steps=10, eval_steps=100, save_steps=100):
-    
+def ensure_utf8(filename):
+    # Read the file
+    with open(filename, 'rb') as f:
+        contents = f.read()
+
+    # Decode the file contents
+    contents_decoded = contents.decode('utf-8', errors='ignore')
+
+    # Write the file back out
+    with codecs.open(filename, 'w', encoding='utf-8') as f:
+        f.write(contents_decoded)
+
+def train(data_dir, model_save_path, model_name="google/flan-t5-base", max_input_length=512, max_output_length=250, num_epochs=6, lora_rank=8, lora_alpha=32, lora_dropout=0.1, train_batch_size=8, eval_batch_size=8, learning_rate=1e-4, weight_decay=0.01, logging_steps=10, eval_steps=100, save_steps=100):
+
+    ensure_utf8(os.path.join(data_dir, "eLife_train.jsonl"))
+    ensure_utf8(os.path.join(data_dir, "eLife_val.jsonl"))
+    ensure_utf8(os.path.join(data_dir, "PLOS_train.jsonl"))
+    ensure_utf8(os.path.join(data_dir, "PLOS_val.jsonl"))
+
     # load datasets from jsonl files and ignore the '\n' characters in the "article" attribute
     elife_dataset = load_dataset("json", data_files={
         "train": os.path.join(data_dir, "eLife_train.jsonl"),
@@ -296,10 +159,6 @@ def train(data_dir, model_save_path, model_name="google/flan-t5-small", max_inpu
     train_dataloader = DataLoader(datasets["train"], batch_size=train_batch_size, shuffle=True, collate_fn=collate_fn)
     eval_dataloader = DataLoader(datasets["validation"], batch_size=eval_batch_size, collate_fn=collate_fn)
     
-    for batch in train_dataloader:
-        print(batch.keys())
-        break
-
     print("Prepared dataloaders")
     
     # Prepare optimizer
@@ -337,7 +196,6 @@ def train(data_dir, model_save_path, model_name="google/flan-t5-small", max_inpu
         # callbacks=[PrintSummaryCallback(tokenizer, max_output_length, eval_dataloader), EvaluateSummaryCallback(tokenizer, compute_metrics,max_output_length, eval_dataloader)],
     )
 
-
     print("Set up PEFT trainer")
 
     # Train loop
@@ -350,13 +208,20 @@ def train(data_dir, model_save_path, model_name="google/flan-t5-small", max_inpu
 
     print("Model saved")
 
-def test(test_dir, model_load_path, predictions_save_path, model_name="google/flan-t5-small", max_input_length=512, max_output_length=128):
+def test(test_dir, model_load_path, predictions_save_path, model_name="google/flan-t5-base", max_input_length=512, max_output_length=350):
     # Load tokenizer and model
     peft_model_path = model_load_path
     config = PeftConfig.from_pretrained(peft_model_path)
     model =  AutoModelForSeq2SeqLM.from_pretrained(config.base_model_name_or_path)
     model = PeftModel.from_pretrained(model, peft_model_path)
     tokenizer = AutoTokenizer.from_pretrained(config.base_model_name_or_path)
+
+    print("Loaded tokenizer and model")
+
+    ensure_utf8(os.path.join(test_dir, "eLife_test.jsonl"))
+    ensure_utf8(os.path.join(test_dir, "PLOS_test.jsonl"))
+
+    print("Made sure files are in utf-8 format")
 
     # Load test datasets
     elife_dataset = load_dataset("json", data_files={
@@ -367,6 +232,7 @@ def test(test_dir, model_load_path, predictions_save_path, model_name="google/fl
         "test": os.path.join(test_dir, "PLOS_test.jsonl")
     })
 
+    
     # Find the number of examples in each dataset
     num_elife = len(elife_dataset["test"])
     num_plos = len(plos_dataset["test"])
@@ -374,20 +240,34 @@ def test(test_dir, model_load_path, predictions_save_path, model_name="google/fl
     # Concatenate the datasets into a combined test dataset
     test_dataset = concatenate_datasets([elife_dataset["test"], plos_dataset["test"]])
 
+    print("Loaded test datasets")
+
+    # Define batch size
+    batch_size = 8
+
     # Generate summaries
     summaries = []
-    for example in test_dataset:
-        inputs = tokenizer(example["article"], return_tensors="pt", truncation=True, max_length=max_input_length)
+    for i in tqdm(range(0, len(test_dataset), batch_size), desc="Generating Summaries"):
+        indices = list(range(i, min(i+batch_size, len(test_dataset))))
+        batch = test_dataset.select(indices)
+        inputs = tokenizer.batch_encode_plus([ex["article"] for ex in batch], return_tensors="pt", truncation=True, max_length=max_input_length, padding='longest')
         summary_ids = model.generate(**inputs, max_length=max_output_length)
-        summary = tokenizer.decode(summary_ids[0], skip_special_tokens=True)
-        summaries.append(summary)
+        summaries.extend([tokenizer.decode(g, skip_special_tokens=True, clean_up_tokenization_spaces=False).encode("ascii", "ignore").decode() for g in summary_ids])
+    print("Generated summaries")
 
     # Save summaries
-    with open(os.path.join(predictions_save_path, "elife.txt"), "w") as f:
+    with open(os.path.join(predictions_save_path, "elife.txt"), "w", encoding='utf-8') as f:
         f.write("\n".join(summaries[:num_elife]))
-    with open(os.path.join(predictions_save_path, "plos.txt"), "w") as f:
+        f.write("\n") # Add a newline as part of the submission format
+    print("Saved eLife summaries")
+
+    with open(os.path.join(predictions_save_path, "plos.txt"), "w", encoding='utf-8') as f:
         f.write("\n".join(summaries[num_elife:]))
+        f.write("\n") # Add a newline as part of the submission format
+
+    print("Saved PLOS summaries")
             
+
 # "train" or "test" the model
 if __name__ == '__main__':
     if device == "cuda":
@@ -396,7 +276,7 @@ if __name__ == '__main__':
 
     # For purpose of kaggle uncomment the following code block
     # data_dir = '/kaggle/input/nlp-a3'
-    # model_save_path = '/kaggle/output/models'
+    # model_save_path = '/kaggle/working/models'
     
     # print("Training model")
     # train(data_dir, model_save_path)

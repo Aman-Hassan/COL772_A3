@@ -165,9 +165,14 @@ cython_debug/
 
 # data folder
 data/
+data2/
 
 # model folder
 models/
-flan-t5_trainer/
-biogpt_model/
+
+# predictions folder
 predictions/
+
+# submission folder
+submission/
+
